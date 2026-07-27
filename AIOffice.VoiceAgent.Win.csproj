@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <Configurations>Debug;Release;Test</Configurations>
+    <Description>Voice agent executable (Windows only). WinRT offline speech recognition + KokoroSharp neural TTS.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="KokoroSharp" Version="0.6.7" />
+    <PackageReference Include="System.Speech" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="voices\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Download kokoro.onnx model from GitHub if not already in the output directory.
+       Removes the need to track the 325 MB binary in git. -->
+  <Target Name="DownloadKokoroModel" BeforeTargets="Build;Publish"
+          Condition="!Exists('$(OutputPath)kokoro.onnx')">
+    <DownloadFile
+        Url="https://github.com/Lyrcaxis/KokoroSharpBinaries/releases/download/v2.0.0/kokoro.onnx"
+        DestinationFileName="kokoro.onnx"
+        DestinationFolder="$(OutputPath)" />
+    <Message Text="kokoro.onnx downloaded to $(OutputPath)" Importance="high" />
+  </Target>
+
+</Project>

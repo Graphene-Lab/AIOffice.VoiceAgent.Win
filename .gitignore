@@ -1,0 +1,19 @@
+# Build results
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+# Auto-downloaded at build time by DownloadKokoroModel target
+kokoro.onnx
+
+# Visual Studio files
+.vs/
+*.user
+*.suo
+*.userprefs
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+*.snupkg
