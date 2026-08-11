@@ -1,10 +1,8 @@
 using System.Diagnostics;
-using System.Globalization;
 using System.Speech.Synthesis;
 using System.Text;
 using System.Text.Json;
-using KokoroSharp;
-using KokoroSharp.Core;
+using AIOffice.VoiceAgent;
 using Windows.Media.SpeechRecognition;
 using Windows.System;
 
@@ -35,17 +33,14 @@ public class VoiceAgent
     /// <summary>WinRT speech recognizer (offline dictation).</summary>
     private SpeechRecognizer? _recognizer;
 
-    /// <summary>Kokoro neural TTS engine. Null when model loading failed.</summary>
-    private KokoroTTS? _tts;
+    /// <summary>Shared Kokoro TTS engine (assets + logic live in AIOffice.VoiceAgent).</summary>
+    private KokoroTts? _kokoro;
 
-    /// <summary>Default Kokoro voice ("af_heart"), used when no language is specified.</summary>
-    private KokoroVoice? _voice;
+    /// <summary>True when Kokoro loaded successfully and is the primary TTS engine.</summary>
+    private bool _ttsReady;
 
     /// <summary>Windows SAPI synthesizer, used as fallback when Kokoro is unavailable or language unsupported.</summary>
     private SpeechSynthesizer? _fallbackSynth;
-
-    /// <summary>True when Kokoro loaded successfully and is the primary TTS engine.</summary>
-    private bool _useKokoro;
 
     /// <summary>Cancels the ongoing RecognizeAsync call.</summary>
     private CancellationTokenSource? _recognitionCts;
@@ -158,33 +153,18 @@ public class VoiceAgent
             // Continue without STA thread - may still work
         }
 
-        // Try Kokoro neural TTS first
-        string ttsEngine;
-        try
-        {
-            var agentDir = Path.GetDirectoryName(typeof(VoiceAgent).Assembly.Location)!;
-            Log.LogStep($"Agent directory: {agentDir}");
-            var voicesDir = Path.Combine(agentDir, "voices");
-            if (Directory.Exists(voicesDir))
-            {
-                KokoroVoiceManager.LoadVoicesFromPath(voicesDir);
-                Log.LogStep($"Voices loaded from: {voicesDir}");
-            }
+        // Try Kokoro neural TTS first (shared engine from AIOffice.VoiceAgent)
+        _kokoro = new KokoroTts(s => WriteJson(new { type = "status", text = s }), _ttsMethod == TtsMethod.Full ? "full" : "fast");
+        _ttsReady = await _kokoro.InitializeAsync();
+        var ttsEngine = _ttsReady ? "kokoro" : "kokoro unavailable";
+        Log.LogStep(_ttsReady ? "Kokoro TTS loaded successfully" : "Kokoro TTS failed, checking SAPI fallback");
 
-            _tts = KokoroTTS.LoadModel();
-            _voice = KokoroVoiceManager.GetVoice("af_heart");
-            _useKokoro = true;
-            ttsEngine = "kokoro";
-            Log.LogStep("Kokoro TTS loaded successfully");
-        }
-        catch (Exception kokoroEx)
+        if (!_ttsReady)
         {
-            Log.LogStep($"Kokoro failed: {kokoroEx.Message}, falling back to SAPI");
             try
             {
                 _fallbackSynth = new SpeechSynthesizer();
-                _useKokoro = false;
-                ttsEngine = $"sapi ({kokoroEx.Message})";
+                ttsEngine = "sapi";
                 Log.LogStep("SAPI fallback TTS ready");
             }
             catch (Exception fallbackEx)
@@ -257,7 +237,7 @@ public class VoiceAgent
             Log.LogStep("=== VoiceAgent shutting down ===");
             StopAll();
             _recognizer?.Dispose();
-            _tts?.Dispose();
+            _kokoro?.Dispose();
             _fallbackSynth?.Dispose();
             try
             {
@@ -472,7 +452,7 @@ public class VoiceAgent
             return;
         }
 
-        text = StripMarkdown(text);
+        text = KokoroTts.StripMarkdown(text);
         var effectiveLang = langCode ?? _recognitionLang;
         Log.LogStep($"Speak: text_len={text.Length}, lang={effectiveLang ?? "default"}, streaming={streaming}");
 
@@ -498,25 +478,11 @@ public class VoiceAgent
             await Task.Delay(300);
         }
 
-        KokoroVoice? voice = null;
-        bool langUnsupported = false;
-
-        if (effectiveLang != null)
+        // Shared Kokoro engine first (language-specific or default voice); SAPI when the language
+        // is unsupported by Kokoro or the engine is unavailable.
+        if (_ttsReady && _kokoro != null && await _kokoro.SpeakAsync(text, effectiveLang))
         {
-            voice = GetVoiceForLanguage(effectiveLang);
-            langUnsupported = voice == null;
-            Log.LogStep($"Language {effectiveLang}: voice={(voice != null ? "found" : "unsupported")}");
-        }
-
-        if (voice != null && _useKokoro && _tts != null)
-        {
-            Log.LogStep("Speaking with Kokoro (language-specific voice)");
-            await SpeakWithKokoroAsync(text, voice);
-        }
-        else if (!langUnsupported && _useKokoro && _tts != null && _voice != null)
-        {
-            Log.LogStep("Speaking with Kokoro (default voice)");
-            await SpeakWithKokoroAsync(text, _voice);
+            Log.LogStep("Speaking with Kokoro");
         }
         else if (_fallbackSynth != null)
         {
@@ -531,49 +497,6 @@ public class VoiceAgent
             await StartRecognitionAsync(_recognitionLang);
             Log.LogStep("Recognition restarted after speak");
         }
-    }
-
-    private async Task SpeakWithKokoroAsync(string text, KokoroVoice voice)
-    {
-        Log.LogStep($"Kokoro TTS starting (method={_ttsMethod})");
-        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        void OnCompleted(SpeechCompletionPacket _) => tcs.TrySetResult();
-        void OnCanceled(SpeechCancellationPacket _) => tcs.TrySetResult();
-        _tts!.OnSpeechCompleted += OnCompleted;
-        _tts.OnSpeechCanceled += OnCanceled;
-        try
-        {
-            if (_ttsMethod == TtsMethod.Full)
-                _tts.Speak(text, voice);
-            else
-                _tts.SpeakFast(text, voice);
-            await tcs.Task;
-            Log.LogStep("Kokoro TTS completed");
-        }
-        finally
-        {
-            _tts.OnSpeechCompleted -= OnCompleted;
-            _tts.OnSpeechCanceled -= OnCanceled;
-        }
-    }
-
-    private static KokoroVoice? GetVoiceForLanguage(string langCode)
-    {
-        var voiceName = langCode switch
-        {
-            "it" => "if_sara",
-            "en" => "af_heart",
-            "fr" => "ff_siwis",
-            "es" => "ef_dora",
-            "ja" => "jf_alpha",
-            "zh" => "zf_xiaobei",
-            "hi" => "hf_alpha",
-            "pt" => "pf_dora",
-            _ => null,
-        };
-        if (voiceName == null) return null;
-        try { return KokoroVoiceManager.GetVoice(voiceName); }
-        catch { return null; }
     }
 
     /// <summary>
@@ -602,65 +525,6 @@ public class VoiceAgent
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────
-
-    private static string StripMarkdown(string text)
-    {
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"```[\s\S]*?```", "");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"`([^`]+)`", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"!\[([^\]]*)\]\([^)]+\)", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\[([^\]]*)\]\([^)]+\)", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\*\*\*(.+?)\*\*\*", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\*\*(.+?)\*\*", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\*(.+?)\*", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"~~(.+?)~~", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^#{1,6}\s+", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^>\s?", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^[\-\*\+]\s+", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^\d+\.\s+", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^[\-\*\s_]{3,}$", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\|-+\|", "");
-        // Trattamento newline: se non preceduto da punteggiatura (. ! ?) diventa ", ",
-        // altrimenti lascia un singolo \n come pausa di fine frase.
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"(?<![.?!])\n", ", ");
-        // Dopo la conversione, compatta spaziature multiple
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"[ \t]{2,}", " ");
-        text = FilterSpeakableChars(text);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\n{3,}", "\n\n");
-        return text.Trim();
-    }
-
-    private static string FilterSpeakableChars(string text)
-    {
-        var result = new StringBuilder(text.Length);
-        for (int i = 0; i < text.Length; i++)
-        {
-            var cat = CharUnicodeInfo.GetUnicodeCategory(text, i);
-            if (cat == UnicodeCategory.UppercaseLetter || cat == UnicodeCategory.LowercaseLetter ||
-                cat == UnicodeCategory.TitlecaseLetter || cat == UnicodeCategory.ModifierLetter ||
-                cat == UnicodeCategory.OtherLetter || cat == UnicodeCategory.DecimalDigitNumber ||
-                cat == UnicodeCategory.LetterNumber || cat == UnicodeCategory.OtherNumber ||
-                cat == UnicodeCategory.SpaceSeparator || cat == UnicodeCategory.LineSeparator ||
-                cat == UnicodeCategory.ParagraphSeparator)
-            {
-                result.Append(text[i]);
-            }
-            else if (cat == UnicodeCategory.DashPunctuation || cat == UnicodeCategory.OpenPunctuation ||
-                     cat == UnicodeCategory.ClosePunctuation || cat == UnicodeCategory.InitialQuotePunctuation ||
-                     cat == UnicodeCategory.FinalQuotePunctuation || cat == UnicodeCategory.OtherPunctuation)
-            {
-                result.Append(text[i]);
-            }
-            else if (cat == UnicodeCategory.CurrencySymbol || cat == UnicodeCategory.MathSymbol)
-            {
-                result.Append(text[i]);
-            }
-            else if (cat == UnicodeCategory.Surrogate)
-            {
-                i++;
-            }
-        }
-        return result.ToString();
-    }
 
     private void StopRecognition()
     {

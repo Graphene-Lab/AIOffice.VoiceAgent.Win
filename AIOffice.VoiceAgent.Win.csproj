@@ -13,29 +13,13 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="KokoroSharp" Version="0.6.7" />
+    <!-- Shared Kokoro TTS (assets + logic) lives in the cross-platform AIOffice.VoiceAgent:
+         the model (kokoro.onnx) is downloaded at build time by that project and deployed at the
+         app base dir, and the voices ship with KokoroSharp 0.8.4. This agent only keeps the
+         Windows-specific recognition (WinRT) and the SAPI fallback synthesizer. -->
+    <ProjectReference Include="..\AIOffice.VoiceAgent\AIOffice.VoiceAgent.csproj" />
+    <PackageReference Include="KokoroSharp" Version="0.8.4" />
     <PackageReference Include="System.Speech" Version="8.0.0" />
   </ItemGroup>
-
-  <ItemGroup>
-    <None Update="voices\**\*" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
-
-  <!-- Provide kokoro.onnx in the output directory (the 325 MB model binary is not
-       tracked in git). Reuses the local copy at the project root when present,
-       otherwise downloads it from GitHub with curl.
-       NOTE: the MSBuild DownloadFile task parameter names changed across SDK
-       versions (Url/SourceUrl, DestinationFileName/DestinationFile), so a plain
-       Exec with curl is used instead — robust on any SDK. -->
-  <Target Name="DownloadKokoroModel" BeforeTargets="Build;Publish"
-          Condition="!Exists('$(OutputPath)kokoro.onnx')">
-    <MakeDir Directories="$(OutputPath)" />
-    <Copy Condition="Exists('kokoro.onnx')"
-          SourceFiles="kokoro.onnx"
-          DestinationFiles="$(OutputPath)kokoro.onnx" />
-    <Exec Condition="!Exists('$(OutputPath)kokoro.onnx')"
-          Command="curl.exe -L --fail -o &quot;$(OutputPath)kokoro.onnx&quot; &quot;https://github.com/Lyrcaxis/KokoroSharpBinaries/releases/download/v2.0.0/kokoro.onnx&quot;" />
-    <Message Text="kokoro.onnx ready at $(OutputPath)" Importance="high" />
-  </Target>
 
 </Project>
