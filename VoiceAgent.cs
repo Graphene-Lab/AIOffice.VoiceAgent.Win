@@ -1,86 +1,41 @@
 using System.Diagnostics;
 using System.Speech.Synthesis;
 using System.Text;
-using System.Text.Json;
 using AIOffice.VoiceAgent;
-using Windows.Media.SpeechRecognition;
-using Windows.System;
 
 namespace AIOffice.VoiceAgent.Win;
 
 /// <summary>
-/// Voice agent executable. Communicates via JSON Lines on stdin/stdout.
+/// Windows voice agent executable — the Windows-specific subclass of
+/// <see cref="VoiceAgentBase"/>: WinRT offline speech recognition + Kokoro TTS with the SAPI
+/// fallback. Everything shared with the cross-platform agent (protocol loop, speak logic,
+/// logging, render path) lives in the base; this class wires only the Windows pieces:
+/// <see cref="WinRtRecognizer"/>, the SAPI fallback and the startup registry/privacy setup.
 ///
-/// Protocol (stdin):
-///   {"cmd":"start"}                         — begin speech recognition
-///   {"cmd":"speak","text":"…","lang":"…"}   — speak text, then resume recognition
-///   {"cmd":"stop"}                          — stop recognition and exit
-///
-/// Protocol (stdout):
-///   {"type":"ready"}              — process initialized (tts field indicates engine)
-///   {"type":"transcript","text"}  — user speech recognized
-///   {"type":"done"}               — speak command finished
-///   {"type":"error","text"}       — error occurred
-///
-/// Diagnostics are written to a file at {AppBase}/logs/{ProcessId}.txt when Log.IsEnabled is true.
-/// Enable by passing --log on the command line, or set Log.IsEnabled = true programmatically.
+/// Protocol (stdin): {"cmd":"start"} | {"cmd":"speak","text":…,"lang":…,"streaming":bool}
+///                    | {"cmd":"stop"}
+/// Protocol (stdout): {"type":"ready","tts":…} | {"type":"transcript","text"}
+///                    | {"type":"done"} | {"type":"error","text"}
 /// </summary>
-public class VoiceAgent
+public class VoiceAgentWin : VoiceAgentBase
 {
-    /// <summary>TTS processing mode.</summary>
-    public enum TtsMethod { Fast, Full }
-
-    /// <summary>WinRT speech recognizer (offline dictation).</summary>
-    private SpeechRecognizer? _recognizer;
-
-    /// <summary>Shared Kokoro TTS engine (assets + logic live in AIOffice.VoiceAgent).</summary>
-    private KokoroTts? _kokoro;
-
     /// <summary>True when Kokoro loaded successfully and is the primary TTS engine.</summary>
     private bool _ttsReady;
 
-    /// <summary>Windows SAPI synthesizer, used as fallback when Kokoro is unavailable or language unsupported.</summary>
+    /// <summary>Windows SAPI synthesizer, used as fallback when Kokoro is unavailable or the
+    /// language is unsupported (file-based TTS — the sentence-chunked path stays parked).</summary>
     private SpeechSynthesizer? _fallbackSynth;
 
-    /// <summary>Cancels the ongoing RecognizeAsync call.</summary>
-    private CancellationTokenSource? _recognitionCts;
-
-    /// <summary>Cancels the main stdin loop, causing a graceful shutdown.</summary>
-    private CancellationTokenSource? _shutdownCts;
-
-    /// <summary>Background task running the recognition loop.</summary>
-    private Task? _recognitionTask;
-
-    /// <summary>True while a streaming speak session is active (recognition paused between chunks).</summary>
-    private bool _streamingSession;
-
-    /// <summary>TTS processing mode: Fast (SpeakFast, default) or Full (Speak).</summary>
-    private TtsMethod _ttsMethod = TtsMethod.Fast;
-
-    /// <summary>DispatcherQueue for STA-thread recognition operations.</summary>
-    private DispatcherQueueController? _dispatchController;
-
-    /// <summary>Language code passed with the last "start" command (e.g. "it"). Null = system default.</summary>
-    private string? _recognitionLang;
-
-    /// <summary>Logs the current managed thread ID (useful for STA/MTA diagnostics).</summary>
-    private static void LogThread(string label) =>
-        Log.LogStep($"[THREAD] {label}: managedThreadId={Environment.CurrentManagedThreadId}");
-
-    // ─── Entry point ──────────────────────────────────────────────────────
-
     /// <summary>
-    /// Entry point. Supports --debug to attach a debugger and --tts-method to
-    /// select between "fast" (SpeakFast, default) and "full" (Speak).
-    /// Step logging is auto-enabled in Debug builds (see <see cref="Log"/>).
-    /// Initializes TTS, then enters the stdin command loop.
+    /// Entry point. Supports --debug to attach a debugger and --tts-method full|fast (fast is
+    /// the default). Initializes TTS, then enters the shared stdin command loop.
     /// </summary>
     public static async Task Main(string[] args)
     {
         AppContext.SetSwitch("System.Runtime.Serialization.EnableNewtonsoftJson", false);
 
         Log.Initialize(Log.IsEnabled);
-        Log.LogStep("=== VoiceAgent starting ===");
+        Log.LogStep("=== VoiceAgent (Windows) starting ===");
         LogThread("Main entry");
 
         // Force UTF-8 for stdin/stdout — the parent process sends/receives JSON-Lines over pipes,
@@ -92,10 +47,10 @@ public class VoiceAgent
             detectEncodingFromByteOrderMarks: true));
         Log.LogStep("UTF-8 stdin configured");
 
-        var ttsMethod = TtsMethod.Fast;
+        var ttsMethod = "fast";
         for (int i = 0; i < args.Length - 1; i++)
             if (args[i] == "--tts-method" && args[i + 1] == "full")
-                ttsMethod = TtsMethod.Full;
+                ttsMethod = "full";
 
         if (args.Contains("--debug"))
         {
@@ -126,38 +81,26 @@ public class VoiceAgent
         }
         catch (Exception ex) { Log.LogStep($"Mic privacy check: {ex.Message}"); }
 
-        var agent = new VoiceAgent { _ttsMethod = ttsMethod };
+        var agent = new VoiceAgentWin { TtsMethod = ttsMethod };
         await agent.RunAsync();
         Log.LogStep("=== VoiceAgent exited ===");
     }
 
-    // ─── Main loop ────────────────────────────────────────────────────────
+    /// <summary>WinRT offline dictation recognizer (STA-thread based).</summary>
+    protected override IAgentRecognizer CreateRecognizer() => new WinRtRecognizer();
 
-    private async Task RunAsync()
+    /// <summary>Continuous device sink (NAudio) for the streaming TTS path.</summary>
+    protected override IAudioSink? CreateAudioSink() => new WindowsAudioSink();
+
+    /// <summary>Waits for Kokoro (primary); when it is unavailable, sets up the SAPI fallback.
+    /// If neither engine is available the startup fails (the base exits without the loop).</summary>
+    protected override async Task InitializeTtsAsync()
     {
-        _shutdownCts = new CancellationTokenSource();
-        Log.LogStep("Entering RunAsync");
-
-        // Create the Dedicated STA Thread via DispatcherQueue for WinRT
-        try
-        {
-            _dispatchController = DispatcherQueueController.CreateOnDedicatedThread();
-            Log.LogStep("DispatcherQueue STA thread created");
-            LogThread("After STA creation (main thread)");
-            // Queue a one-shot to log the STA thread ID
-            _dispatchController.DispatcherQueue.TryEnqueue(() => LogThread("STA thread (inside DispatcherQueue)"));
-        }
-        catch (Exception ex)
-        {
-            Log.LogStep($"Failed to create DispatcherQueue: {ex.Message}");
-            // Continue without STA thread - may still work
-        }
-
-        // Try Kokoro neural TTS first (shared engine from AIOffice.VoiceAgent)
-        _kokoro = new KokoroTts(s => WriteJson(new { type = "status", text = s }), _ttsMethod == TtsMethod.Full ? "full" : "fast");
-        _ttsReady = await _kokoro.InitializeAsync();
+        Tts = new KokoroTts(s => WriteJson(new { type = "status", text = s }), TtsMethod);
+        _ttsReady = await Tts.InitializeAsync();
         var ttsEngine = _ttsReady ? "kokoro" : "kokoro unavailable";
         Log.LogStep(_ttsReady ? "Kokoro TTS loaded successfully" : "Kokoro TTS failed, checking SAPI fallback");
+        TtsTask = Task.FromResult(_ttsReady);
 
         if (!_ttsReady)
         {
@@ -169,394 +112,41 @@ public class VoiceAgent
             }
             catch (Exception fallbackEx)
             {
-                WriteJson(new { type = "error", text = $"No TTS available: {fallbackEx.Message}" });
+                WriteError($"No TTS available: {fallbackEx.Message}");
                 Log.LogStep($"No fallback TTS either: {fallbackEx.Message}");
-                return;
+                return;   // StartupFailed stays true below
             }
         }
-
-        WriteJson(new { type = "ready", tts = ttsEngine });
-        Log.LogStep($"Ready sent, TTS={ttsEngine}");
-
-        try
-        {
-            while (!_shutdownCts.Token.IsCancellationRequested)
-            {
-                var line = await Console.In.ReadLineAsync();
-                if (line == null)
-                {
-                    Log.LogStep("stdin EOF, exiting main loop");
-                    break;
-                }
-
-                Log.LogStep($"stdin cmd: {line}");
-
-                JsonDocument doc;
-                try { doc = JsonDocument.Parse(line); }
-                catch
-                {
-                    Log.LogStep($"Invalid JSON from stdin: {line}");
-                    continue;
-                }
-
-                using (doc)
-                {
-                    var root = doc.RootElement;
-                    var cmd = root.TryGetProperty("cmd", out var c) ? c.GetString() : null;
-                    Log.LogStep($"Processing command: {cmd}");
-
-                    switch (cmd)
-                    {
-                        case "start":
-                            var startLang = root.TryGetProperty("lang", out var sl) ? sl.GetString() : null;
-                            _recognitionLang = startLang;
-                            await StartRecognitionAsync(startLang);
-                            Log.LogStep($"StartRecognitionAsync completed (lang={startLang ?? "default"})");
-                            break;
-
-                        case "speak":
-                            var text = root.TryGetProperty("text", out var t) ? t.GetString() : "";
-                            var lang = root.TryGetProperty("lang", out var l) ? l.GetString() : null;
-                            var streaming = root.TryGetProperty("streaming", out var s) && s.GetBoolean();
-                            Log.LogStep($"Speak: lang={lang}, streaming={streaming}, text_len={text?.Length ?? 0}");
-                            await SpeakAndPauseRecognitionAsync(text, lang, streaming);
-                            WriteJson(new { type = "done" });
-                            Log.LogStep("Speak done");
-                            break;
-
-                        case "stop":
-                            Log.LogStep("Stop command received");
-                            StopAll();
-                            return;
-                    }
-                }
-            }
-        }
-        finally
-        {
-            Log.LogStep("=== VoiceAgent shutting down ===");
-            StopAll();
-            _recognizer?.Dispose();
-            _kokoro?.Dispose();
-            _fallbackSynth?.Dispose();
-            try
-            {
-                _dispatchController?.ShutdownQueueAsync().AsTask().Wait(1000);
-                Log.LogStep("DispatcherQueue shut down");
-            }
-            catch { }
-        }
+        _readyEngine = ttsEngine;
     }
 
-    // ─── Recognition ──────────────────────────────────────────────────────
+    private string? _readyEngine;
 
-    /// <summary>
-    /// Starts continuous speech recognition on the dedicated STA DispatcherQueue thread.
-    /// </summary>
-    /// <param name="langCode">Optional two-letter ISO language code (e.g. "it", "en").
-    /// When null, uses the system default language.</param>
-    private async Task StartRecognitionAsync(string? langCode = null)
+    /// <summary>True when no TTS engine could be initialized (Kokoro + SAPI both failed) — the
+    /// base exits without entering the command loop.</summary>
+    protected override bool StartupFailed => !_ttsReady && _fallbackSynth == null;
+
+    /// <summary>The "ready" payload reports which TTS engine is active.</summary>
+    protected override object ReadyPayload() => new { type = "ready", tts = _readyEngine ?? "kokoro" };
+
+    /// <summary>SAPI fallback — speaks with the Windows system synthesizer (file-based path).</summary>
+    protected override bool TrySpeakOsFallback(string text, string? langCode)
     {
-        Log.LogStep($"StartRecognitionAsync called (lang={langCode ?? "default"})");
-
-        StopRecognition();
-
-        // If we have a DispatcherQueue, run recognizer setup on the STA thread
-        if (_dispatchController != null)
-        {
-            var queue = _dispatchController.DispatcherQueue;
-            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            bool posted = queue.TryEnqueue(async () =>
-            {
-                try
-                {
-                    await SetupAndRunRecognizerAsync(langCode);
-                    tcs.TrySetResult(true);
-                }
-                catch (Exception ex)
-                {
-                    Log.LogStep($"Recognizer setup failed on STA thread: {ex.Message}");
-                    WriteJson(new { type = "error", text = $"Recognition failed: {ex.Message}" });
-                    tcs.TrySetResult(false);
-                }
-            });
-
-            if (posted)
-            {
-                await tcs.Task;
-                Log.LogStep("Recognizer setup completed on STA thread");
-            }
-            else
-                Log.LogStep("Failed to post to DispatcherQueue");
-        }
-        else
-        {
-            // Fallback: run directly on current thread
-            Log.LogStep("No DispatcherQueue, running directly");
-            await SetupAndRunRecognizerAsync(langCode);
-        }
+        if (_fallbackSynth == null) return false;
+        Log.LogStep("Speaking with SAPI fallback");
+        _fallbackSynth.Speak(text);
+        return true;
     }
 
-    /// <summary>
-    /// Sets up the SpeechRecognizer and starts the recognition loop.
-    /// MUST be called from the STA DispatcherQueue thread when available.
-    /// </summary>
-    /// <param name="langCode">Optional two-letter ISO language code (e.g. "it", "en").
-    /// When null, uses the system default language.</param>
-    private async Task SetupAndRunRecognizerAsync(string? langCode = null)
+    /// <summary>Extra cleanup: disposes the SAPI synthesizer.</summary>
+    protected override void StopAll()
     {
-        Log.LogStep($"Setting up SpeechRecognizer (lang={langCode ?? "default"})");
-
-        _recognizer?.Dispose();
-
-        if (langCode != null)
-        {
-            // Convert 2-letter ISO code to WinRT language tag (e.g. "it" → "it-IT", "en" → "en-US")
-            var winRtLang = GetWinRtLanguageTag(langCode);
-            if (winRtLang != null)
-            {
-                try
-                {
-                    var language = new Windows.Globalization.Language(winRtLang);
-                    _recognizer = new SpeechRecognizer(language);
-                    Log.LogStep($"SpeechRecognizer created with language: {winRtLang}");
-                }
-                catch (Exception ex)
-                {
-                    Log.LogStep($"Failed to create recognizer with lang '{winRtLang}': {ex.Message}. Falling back to default.");
-                    _recognizer = new SpeechRecognizer();
-                }
-            }
-            else
-            {
-                Log.LogStep($"Unsupported language code '{langCode}', using system default");
-                _recognizer = new SpeechRecognizer();
-            }
-        }
-        else
-        {
-            _recognizer = new SpeechRecognizer();
-        }
-
-        var langTag = _recognizer.CurrentLanguage?.LanguageTag ?? "(none)";
-        Log.LogStep($"SpeechRecognizer language: {langTag}");
-
-        // Log available recognizer languages
-        try
-        {
-            var supportedLangs = SpeechRecognizer.SupportedGrammarLanguages?.ToList();
-            Log.LogStep($"Supported grammar languages: {supportedLangs?.Count ?? 0}");
-            if (supportedLangs != null)
-                foreach (var lang in supportedLangs.Take(3))
-                    Log.LogStep($"  - {lang.LanguageTag} ({lang.DisplayName})");
-        }
-        catch (Exception ex) { Log.LogStep($"Error listing languages: {ex.Message}"); }
-
-        _recognizer.Constraints.Add(
-            new SpeechRecognitionTopicConstraint(SpeechRecognitionScenario.Dictation, "dictation"));
-        Log.LogStep("Dictation constraint added");
-
-        // Increase timeouts for a more forgiving listening experience
-        _recognizer.Timeouts.InitialSilenceTimeout = TimeSpan.FromSeconds(15);
-        _recognizer.Timeouts.EndSilenceTimeout = TimeSpan.FromMilliseconds(500);
-        _recognizer.Timeouts.BabbleTimeout = TimeSpan.FromSeconds(0);
-        Log.LogStep($"Timeouts: initialSilence={_recognizer.Timeouts.InitialSilenceTimeout.TotalSeconds}s " +
-                     $"endSilence={_recognizer.Timeouts.EndSilenceTimeout.TotalMilliseconds}ms");
-
-        // Compile
-        Log.LogStep("Compiling constraints...");
-        var compileResult = await _recognizer.CompileConstraintsAsync();
-        Log.LogStep($"Compile result: {compileResult.Status}");
-
-        if (compileResult.Status != SpeechRecognitionResultStatus.Success)
-        {
-            WriteError($"Compile failed: {compileResult.Status}");
-            Log.LogStep($"COMPILE FAILED: {compileResult.Status}");
-            return;
-        }
-
-        _recognitionCts = new CancellationTokenSource();
-        var token = _recognitionCts.Token;
-        var recognizerRef = _recognizer;
-
-        Log.LogStep("Starting recognition loop");
-        LogThread("Before Task.Run (should be STA or calling thread)");
-
-        // Start a continuous recognition loop on the STA thread
-        _recognitionTask = Task.Run(async () =>
-        {
-            Log.LogStep("Recognition loop task started");
-            LogThread("Inside Task.Run (recognition loop)");
-            int attempt = 0;
-
-            while (!token.IsCancellationRequested)
-            {
-                attempt++;
-                SpeechRecognitionResult result;
-                try
-                {
-                    Log.LogStep($"RecognizeAsync call #{attempt} starting...");
-                    result = await recognizerRef.RecognizeAsync()
-                        .AsTask(token);
-                    Log.LogStep($"RecognizeAsync #{attempt} returned: Status={result.Status}(raw={(int)result.Status}), Text='{result.Text}'");
-
-                    if (result.Status == SpeechRecognitionResultStatus.Success)
-                    {
-                        if (!string.IsNullOrWhiteSpace(result.Text))
-                        {
-                            var trimmed = result.Text.Trim();
-                            WriteJson(new { type = "transcript", text = trimmed });
-                            Log.LogStep($"TRANSCRIPT: '{trimmed}'");
-                        }
-                        else
-                        {
-                            Log.LogStep("Success but empty text");
-                        }
-                    }
-                    else
-                    {
-                        var statusRaw = (int)result.Status;
-                        Log.LogStep($"Non-success: status={result.Status}(raw={statusRaw}) text='{result.Text}'");
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    Log.LogStep("Recognition loop cancelled");
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    Log.LogStep($"RecognizeAsync error: {ex.GetType().Name}: {ex.Message}");
-                    WriteError(ex.Message);
-                    await Task.Delay(1000);
-                    continue;
-                }
-            }
-
-            Log.LogStep("Recognition loop exited");
-        });
+        base.StopAll();
+        try { _fallbackSynth?.Dispose(); } catch { }
+        _fallbackSynth = null;
     }
 
-    // ─── TTS ──────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Stops recognition, speaks the text, then restarts recognition.
-    /// Uses Kokoro neural TTS when available, otherwise falls back to Windows SAPI.
-    /// </summary>
-    private async Task SpeakAndPauseRecognitionAsync(string? text, string? langCode = null, bool streaming = false)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            Log.LogStep("Speak skipped: empty text");
-            return;
-        }
-
-        text = KokoroTts.StripMarkdown(text);
-        var effectiveLang = langCode ?? _recognitionLang;
-        Log.LogStep($"Speak: text_len={text.Length}, lang={effectiveLang ?? "default"}, streaming={streaming}");
-
-        if (streaming)
-        {
-            if (!_streamingSession)
-            {
-                _streamingSession = true;
-                Log.LogStep("First streaming chunk: pausing recognition");
-                StopRecognition();
-                await Task.Delay(300);
-            }
-        }
-        else if (_streamingSession)
-        {
-            _streamingSession = false;
-            Log.LogStep("Final streaming chunk: ending streaming session");
-        }
-        else
-        {
-            Log.LogStep("Non-streaming speak: stopping recognition");
-            StopRecognition();
-            await Task.Delay(300);
-        }
-
-        // Shared Kokoro engine first (language-specific or default voice); SAPI when the language
-        // is unsupported by Kokoro or the engine is unavailable.
-        if (_ttsReady && _kokoro != null && await _kokoro.SpeakAsync(text, effectiveLang))
-        {
-            Log.LogStep("Speaking with Kokoro");
-        }
-        else if (_fallbackSynth != null)
-        {
-            Log.LogStep("Speaking with SAPI fallback");
-            _fallbackSynth.Speak(text);
-        }
-
-        if (!streaming)
-        {
-            Log.LogStep("Non-streaming speak: restarting recognition after 500ms delay");
-            await Task.Delay(500);
-            await StartRecognitionAsync(_recognitionLang);
-            Log.LogStep("Recognition restarted after speak");
-        }
-    }
-
-    /// <summary>
-    /// Converts a two-letter ISO language code to a WinRT language tag (e.g. "it" → "it-IT").
-    /// Returns null for unsupported or unrecognized codes.
-    /// </summary>
-    private static string? GetWinRtLanguageTag(string langCode)
-    {
-        return langCode.ToLowerInvariant() switch
-        {
-            "it" => "it-IT",
-            "en" => "en-US",
-            "fr" => "fr-FR",
-            "es" => "es-ES",
-            "de" => "de-DE",
-            "pt" => "pt-BR",
-            "ja" => "ja-JP",
-            "zh" => "zh-CN",
-            "ru" => "ru-RU",
-            "ar" => "ar-SA",
-            "nl" => "nl-NL",
-            "pl" => "pl-PL",
-            "tr" => "tr-TR",
-            _ => null,
-        };
-    }
-
-    // ─── Helpers ──────────────────────────────────────────────────────────
-
-    private void StopRecognition()
-    {
-        if (_recognitionCts != null)
-        {
-            Log.LogStep("StopRecognition: cancelling CTS");
-            _recognitionCts.Cancel();
-            _recognitionCts.Dispose();
-            _recognitionCts = null;
-        }
-        _recognitionTask = null;
-        Log.LogStep("StopRecognition complete");
-    }
-
-    private void StopAll()
-    {
-        Log.LogStep("StopAll");
-        StopRecognition();
-        _shutdownCts?.Cancel();
-    }
-
-    private static void WriteJson(object obj)
-    {
-        var json = JsonSerializer.Serialize(obj, new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        });
-        Console.WriteLine(json);
-    }
-
-    private static void WriteError(string message)
-    {
-        WriteJson(new { type = "error", text = message });
-    }
+    /// <summary>Logs the current managed thread ID (useful for STA/MTA diagnostics).</summary>
+    private static void LogThread(string label) =>
+        Log.LogStep($"[THREAD] {label}: managedThreadId={Environment.CurrentManagedThreadId}");
 }

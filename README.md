@@ -2,6 +2,19 @@
 
 Windows-only executable providing **offline speech recognition** (WinRT OneCore dictation) and **neural text-to-speech** (KokoroSharp via ONNX runtime, with Windows SAPI fallback). Communicates with the host process via JSON Lines over stdin/stdout.
 
+## Architecture
+
+`VoiceAgentWin` is a thin subclass of **`VoiceAgentBase`** (in `AIOffice.VoiceAgent`, referenced
+as a project): the JSON-Lines protocol loop, logging, the unified speak logic and the render
+path are INHERITED — this project contributes only the Windows pieces:
+
+- `WinRtRecognizer` (`IAgentRecognizer`) — WinRT offline dictation on a dedicated STA thread
+- `WindowsAudioSink` (`IAudioSink`) — continuous NAudio buffered output for streaming TTS
+- the SAPI fallback synthesizer
+
+There is no duplicated protocol/log code between the two agents (the old local `Log.cs` and
+the duplicated main loop were removed by the refactor).
+
 ## Protocol
 
 ### stdin (host → agent)
@@ -12,9 +25,12 @@ Windows-only executable providing **offline speech recognition** (WinRT OneCore 
 | `{"cmd":"stop"}` | Stop recognition and exit |
 | `{"cmd":"speak","text":"...","lang":"..."}` | Speak text, pause recognition, resume when done |
 
-The optional `streaming` flag keeps recognition paused between consecutive calls:
-- `{"cmd":"speak","text":"first","lang":"it","streaming":true}` — speak, stay paused
+The optional `streaming` flag keeps recognition paused between consecutive calls and routes
+the text to the **continuous audio sink** (NAudio) — first sound as soon as the first sentence
+is synthesized, no gaps between sentences:
+- `{"cmd":"speak","text":"first","lang":"it","streaming":true}` — speak (streamed), stay paused
 - `{"cmd":"speak","text":"last","lang":"it","streaming":false}` — speak, resume recognition
+- `{"cmd":"speak","text":"","lang":"it"}` — end-of-turn: drains the TTS tail, resumes recognition
 
 ### stdout (agent → host)
 

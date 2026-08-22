@@ -19,7 +19,9 @@
          Windows-specific recognition (WinRT) and the SAPI fallback synthesizer. -->
     <ProjectReference Include="..\AIOffice.VoiceAgent\AIOffice.VoiceAgent.csproj" />
     <PackageReference Include="KokoroSharp" Version="0.8.4" />
-    <PackageReference Include="System.Speech" Version="8.0.0" />
+    <!-- 9.0.0 matches AIOffice.VoiceAgent (which this project references): the cross agent added
+         the SAPI TTS fallback with System.Speech 9.0.0, so the versions must not diverge. -->
+    <PackageReference Include="System.Speech" Version="9.0.0" />
   </ItemGroup>
 
 </Project>
