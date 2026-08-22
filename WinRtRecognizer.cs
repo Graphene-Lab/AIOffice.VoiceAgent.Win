@@ -20,6 +20,10 @@ public sealed class WinRtRecognizer : IAgentRecognizer
     /// <summary>Raised when recognition cannot continue.</summary>
     public event Action<string>? Error;
 
+    /// <summary>WinRT has no explicit VAD contract — never raised (the interface member exists
+    /// so both recognizers share the protocol; the SIP bridge only listens for whisper's).</summary>
+    public event Action<string>? VadState;
+
     /// <summary>WinRT captures from the microphone — external PCM is not supported (no-op).</summary>
     public bool ExternalInput { get; set; }
 
