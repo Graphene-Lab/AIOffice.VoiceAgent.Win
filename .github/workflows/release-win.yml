@@ -113,14 +113,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # -R is required: the checkout lives under ./AIOffice.VoiceAgent.Win, so the
+          # workspace root is not a git repository and gh cannot discover the repo itself.
+          REPO="Graphene-Lab/AIOffice.VoiceAgent.Win"
           VERSION="${{ steps.info.outputs.version }}"
           ZIP="AIOffice.VoiceAgent.Win-$VERSION.zip"
           ls -lh "$ZIP"
           NOTES="Self-contained win-x64 voice agent (WinRT recognition + Kokoro TTS). Unzip and place the payload in the AgentBridge voiceagent/ folder."
-          if gh release view "v$VERSION" >/dev/null 2>&1; then
+          if gh release view "v$VERSION" -R "$REPO" >/dev/null 2>&1; then
             # Same-day re-release: refresh the asset instead of failing on the existing tag.
-            gh release upload "v$VERSION" "$ZIP" --clobber
-            gh release edit "v$VERSION" --notes "$NOTES"
+            gh release upload "v$VERSION" "$ZIP" -R "$REPO" --clobber
+            gh release edit "v$VERSION" -R "$REPO" --notes "$NOTES"
           else
-            gh release create "v$VERSION" "$ZIP" --title "v$VERSION" --notes "$NOTES"
+            gh release create "v$VERSION" "$ZIP" -R "$REPO" --title "v$VERSION" --notes "$NOTES"
           fi
