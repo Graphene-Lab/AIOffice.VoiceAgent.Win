@@ -19,7 +19,7 @@
        triggers publish.yml (NuGet) and release-win.yml (standalone win-x64 zip) — a plain push
        is a code-only sync and publishes nothing. -->
   <PropertyGroup>
-    <IsPrerelease>true</IsPrerelease>
+    <IsPrerelease>false</IsPrerelease>
     <Version Condition="'$(IsPrerelease)' == 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))-prerelease</Version>
     <Version Condition="'$(IsPrerelease)' != 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))</Version>
     <PackageId>Graphene.AIOffice.VoiceAgent.Win</PackageId>
