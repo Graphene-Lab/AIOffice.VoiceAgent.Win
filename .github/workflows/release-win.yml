@@ -1,0 +1,126 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  release-win.yml — Windows standalone VoiceAgent release workflow
+#  (AIOffice.VoiceAgent.Win, Graphene-Lab)
+#
+#  Push a tag v* (date version, e.g. v1.26.09.03) to publish the self-contained
+#  win-x64 agent as a GitHub Release asset: AIOffice.VoiceAgent.Win-<version>.zip.
+#  workflow_dispatch without a tag falls back to today's date version.
+#
+#  What it does:
+#    - checks out BOTH repos: this repo (./AIOffice.VoiceAgent.Win) and the public
+#      Graphene-Lab/AIOffice.VoiceAgent (./AIOffice.VoiceAgent) — the Win project keeps
+#      a plain ProjectReference to ..\AIOffice.VoiceAgent, so its sources must sit at
+#      that exact relative path for restore/build;
+#    - `dotnet publish -r win-x64 --self-contained true` with PublishSingleFile +
+#      IncludeNativeLibrariesForSelfExtract (retry on restore, like the plugin pattern).
+#      The publish carries the Kokoro voices and kokoro.onnx thanks to the csproj
+#      AfterTargets=Publish targets (CopyKokoroVoicesToPublish / EnsureKokoroModelInPublishDir);
+#    - zips the payload with a top-level AIOffice.VoiceAgent.Win/ folder;
+#    - creates (or refreshes) the GitHub Release with the zip.
+#
+#  NuGet publication stays in the SEPARATE publish.yml — hosts never touch NuGet.
+#  This zip is what the AgentBridge release pipeline downloads to populate its
+#  voiceagent/ folder. The repo MUST be PUBLIC for anonymous downloads.
+# ═══════════════════════════════════════════════════════════════════════
+name: Windows VoiceAgent Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: AIOffice.VoiceAgent.Win
+      # Public sibling repo providing the shared TTS logic + project-reference target.
+      - uses: actions/checkout@v4
+        with:
+          repository: Graphene-Lab/AIOffice.VoiceAgent
+          path: AIOffice.VoiceAgent
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve version
+        id: info
+        shell: bash
+        run: |
+          # Tag v1.yy.MM.dd → 1.yy.MM.dd; a workflow_dispatch run has no tag (GITHUB_REF_NAME
+          # is the branch), so fall back to today's date version.
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in
+            1.*.*.*) ;;
+            *) VERSION="$(date +1.%y.%m.%d)" ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Restore + publish self-contained win-x64 single file
+        shell: bash
+        run: |
+          # Retry while the date-versioned dependency packages propagate on nuget.org.
+          # During this publish the sibling's DownloadKokoroModel target fetches the 325 MB
+          # kokoro.onnx into its own bin (NOT packing, so the _IsPacking gate is off), and the
+          # EnsureKokoroModelInPublishDir target then reuses that copy for the publish dir.
+          for i in 1 2 3 4 5 6; do
+            dotnet publish AIOffice.VoiceAgent.Win/AIOffice.VoiceAgent.Win.csproj -c Release \
+              -r win-x64 --self-contained true \
+              -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
+              -o ./voiceagent-out -p:RestoreForce=true && break
+            echo "retry $i (waiting for dependency packages on nuget.org)..."
+            sleep 60
+          done
+
+      - name: Verify publish output assets
+        shell: bash
+        run: |
+          # Hard-fail only when the executable is missing (nothing to release); the voices and
+          # the model are reported with explicit warnings instead of aborting the pipeline.
+          if [ ! -f ./voiceagent-out/AIOffice.VoiceAgent.Win.exe ]; then
+            echo "::error::AIOffice.VoiceAgent.Win.exe missing from ./voiceagent-out — the publish produced no executable"
+            exit 1
+          fi
+          [ -d ./voiceagent-out/voices ] || echo "::warning::voices/ missing from ./voiceagent-out — the published agent cannot load Kokoro voices"
+          [ -f ./voiceagent-out/kokoro.onnx ] || echo "::warning::kokoro.onnx missing from ./voiceagent-out — the published agent has no TTS model"
+          echo "--- publish output ---"
+          ls -lh ./voiceagent-out
+
+      - name: Stage + zip self-contained payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.info.outputs.version }}"
+          $zipName = "AIOffice.VoiceAgent.Win-$version.zip"
+          # The zip carries a top-level AIOffice.VoiceAgent.Win/ folder holding the CONTENT
+          # of voiceagent-out (staging outside the workspace keeps it out of the repo tree).
+          $stageDir = Join-Path $env:RUNNER_TEMP "stage\AIOffice.VoiceAgent.Win"
+          Remove-Item -Recurse -Force (Split-Path $stageDir) -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $env:GITHUB_WORKSPACE "voiceagent-out\*") $stageDir
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE $zipName
+          Compress-Archive -Path $stageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $item = Get-Item $zipPath
+          Write-Host "Created $($item.FullName) ($([math]::Round($item.Length / 1MB, 1)) MB)"
+
+      - name: GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.info.outputs.version }}"
+          ZIP="AIOffice.VoiceAgent.Win-$VERSION.zip"
+          ls -lh "$ZIP"
+          NOTES="Self-contained win-x64 voice agent (WinRT recognition + Kokoro TTS). Unzip and place the payload in the AgentBridge voiceagent/ folder."
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            # Same-day re-release: refresh the asset instead of failing on the existing tag.
+            gh release upload "v$VERSION" "$ZIP" --clobber
+            gh release edit "v$VERSION" --notes "$NOTES"
+          else
+            gh release create "v$VERSION" "$ZIP" --title "v$VERSION" --notes "$NOTES"
+          fi

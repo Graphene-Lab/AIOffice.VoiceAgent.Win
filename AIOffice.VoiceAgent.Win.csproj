@@ -12,6 +12,23 @@
     <Description>Voice agent executable (Windows only). WinRT offline speech recognition + KokoroSharp neural TTS.</Description>
   </PropertyGroup>
 
+  <!-- NuGet packaging + release gate (Graphene-Lab convention, same scheme as AgentBridge):
+       IsPrerelease=true while iterating → the version gets "-prerelease". Set IsPrerelease=false
+       only when the test cycles proved the version works → a real release. Date-based auto
+       version 1.yy.MM.dd (e.g. 1.26.09.03). Publishing is an explicit act: pushing a tag v*
+       triggers publish.yml (NuGet) and release-win.yml (standalone win-x64 zip) — a plain push
+       is a code-only sync and publishes nothing. -->
+  <PropertyGroup>
+    <IsPrerelease>true</IsPrerelease>
+    <Version Condition="'$(IsPrerelease)' == 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))-prerelease</Version>
+    <Version Condition="'$(IsPrerelease)' != 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))</Version>
+    <PackageId>Graphene.AIOffice.VoiceAgent.Win</PackageId>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Andrea Bruno</Copyright>
+    <RepositoryUrl>https://github.com/Graphene-Lab/AIOffice.VoiceAgent.Win</RepositoryUrl>
+    <PackageTags>voice;agent;tts;kokoro;winrt;win-x64;automation</PackageTags>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- Shared Kokoro TTS (assets + logic) lives in the cross-platform AIOffice.VoiceAgent:
          the model (kokoro.onnx) is downloaded at build time by that project and deployed at the
@@ -23,5 +40,102 @@
          the SAPI TTS fallback with System.Speech 9.0.0, so the versions must not diverge. -->
     <PackageReference Include="System.Speech" Version="9.0.0" />
   </ItemGroup>
+
+  <!-- The README is referenced by PackageReadmeFile above and must travel inside the nupkg.
+       Explicit Include (not None Update): consistent with AIOffice.VoiceAgent — an Update only
+       matches when the default-items pass put the README in @(None), which is not guaranteed. -->
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- KokoroSharp's buildTransitive target copies the voices to $(OutputPath) but the publish
+       pipeline does not carry them to $(PublishDir) (same gap as AIOffice.VoiceAgent's
+       CopyKokoroVoicesToPublish). Reproduce that copy after Publish so a standalone published
+       agent can load voices. voices-zh sits NESTED inside voices/ in the actual package layout,
+       so the single recursive copy covers both (same approach as AgentBridge). -->
+  <Target Name="CopyKokoroVoicesToPublish" AfterTargets="Publish"
+          Condition="'$(PublishDir)' != '' and Exists('$(OutputPath)voices\')">
+    <ItemGroup>
+      <_KokoroVoices Include="$(OutputPath)voices\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_KokoroVoices)"
+          DestinationFiles="@(_KokoroVoices->'$(PublishDir)voices\%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+
+  <!-- Provide kokoro.onnx in the publish dir (the 325 MB model binary is not tracked in git): a
+       published agent needs it loose next to the exe. Sources in order, all skipped once the file
+       is present:
+         1) ..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0-windows\$(RuntimeIdentifier)\
+            kokoro.onnx — the sibling project's own DownloadKokoroModel target fetches the model
+            into ITS output while this project's ProjectReference builds it (a RID publish builds
+            the reference RID-specific, so this is the CI path and reuses one download);
+         2) ..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0-windows\kokoro.onnx — non-RID
+            windows build output of the sibling (dev machines that built it standalone);
+         3) ..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0\kokoro.onnx — standalone net10.0
+            deploy output of the cross-platform project;
+         4) kokoro.onnx at this repo root;
+         5) download fallback with curl (same URL as AIOffice.VoiceAgent's DownloadKokoroModel). -->
+  <Target Name="EnsureKokoroModelInPublishDir" AfterTargets="Publish"
+          Condition="'$(PublishDir)' != '' and !Exists('$(PublishDir)kokoro.onnx')">
+    <MakeDir Directories="$(PublishDir)" />
+    <Copy Condition="Exists('..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0-windows\$(RuntimeIdentifier)\kokoro.onnx')"
+          SourceFiles="..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0-windows\$(RuntimeIdentifier)\kokoro.onnx"
+          DestinationFiles="$(PublishDir)kokoro.onnx" />
+    <Copy Condition="!Exists('$(PublishDir)kokoro.onnx') and Exists('..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0-windows\kokoro.onnx')"
+          SourceFiles="..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0-windows\kokoro.onnx"
+          DestinationFiles="$(PublishDir)kokoro.onnx" />
+    <Copy Condition="!Exists('$(PublishDir)kokoro.onnx') and Exists('..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0\kokoro.onnx')"
+          SourceFiles="..\AIOffice.VoiceAgent\bin\$(Configuration)\net10.0\kokoro.onnx"
+          DestinationFiles="$(PublishDir)kokoro.onnx" />
+    <Copy Condition="!Exists('$(PublishDir)kokoro.onnx') and Exists('kokoro.onnx')"
+          SourceFiles="kokoro.onnx"
+          DestinationFiles="$(PublishDir)kokoro.onnx" />
+    <Exec Condition="!Exists('$(PublishDir)kokoro.onnx')"
+          Command="curl.exe -L --fail -o &quot;$(PublishDir)kokoro.onnx&quot; &quot;https://github.com/Lyrcaxis/KokoroSharpBinaries/releases/download/v2.0.0/kokoro.onnx&quot;" />
+    <Message Text="kokoro.onnx ready in $(PublishDir)" Importance="high" />
+  </Target>
+
+  <!-- The Microsoft.ML.OnnxRuntime package (pulled in by KokoroSharp) also carries C++ import
+       libraries (runtimes/win-x64/native/*.lib) — build-time only, junk in the released
+       archive (same cleanup as AgentBridge's CopyTtsAssetsToPublish). -->
+  <Target Name="RemoveOnnxRuntimeImportLibs" AfterTargets="Publish"
+          Condition="'$(PublishDir)' != '' and Exists('$(PublishDir)onnxruntime.lib')">
+    <Delete Files="$(PublishDir)onnxruntime.lib;$(PublishDir)onnxruntime_providers_shared.lib;$(PublishDir)onnxruntime_providers_cuda.lib;$(PublishDir)onnxruntime_providers_tensorrt.lib" />
+  </Target>
+
+  <!-- Date-based auto version + NuGet publishing, same mechanism as the other Graphene repos
+       (DocumentTool/AIOrchestrator). Local/VS: `dotnet pack` publishes with the NuGetApiKey env
+       var; CI: .github/workflows/publish.yml pushes the package (pack runs with SkipNuGetPush).
+       Packing never downloads kokoro.onnx: the sibling project's DownloadKokoroModel target is
+       gated on _IsPacking (set by the dotnet CLI during pack) because the model is not part of
+       the NuGet package. -->
+  <Target Name="SetPackageVersion" DependsOnTargets="Build">
+    <PropertyGroup>
+      <PackageVersion>$(Version)</PackageVersion>
+    </PropertyGroup>
+  </Target>
+
+  <PropertyGroup>
+    <NuGetSource Condition="'$(NuGetSource)' == ''">https://api.nuget.org/v3/index.json</NuGetSource>
+  </PropertyGroup>
+
+  <Target Name="CleanOldNuGetPackages" BeforeTargets="GenerateNuspec">
+    <CreateItem Include="$(PackageOutputPath)*.nupkg">
+      <Output TaskParameter="Include" ItemName="_OldNupkg" />
+    </CreateItem>
+    <Delete Files="@(_OldNupkg)" />
+  </Target>
+
+  <Target Name="PublishPackageToNuGet" AfterTargets="Pack" Condition="'$(SkipNuGetPush)' != 'true'">
+    <Error Condition="'$(NuGetApiKey)' == ''"
+           Text="NuGetApiKey env var not set: run `setx NuGetApiKey &lt;key&gt;` and restart Visual Studio." />
+    <CreateItem Include="$(PackageOutputPath)*.nupkg">
+      <Output TaskParameter="Include" ItemName="_NuGetPackageToPush" />
+    </CreateItem>
+    <Error Condition="'@(_NuGetPackageToPush)' == ''"
+           Text="No package found in $(PackageOutputPath): pack produced no expected file." />
+    <Message Importance="High" Text="Publishing %(_NuGetPackageToPush.Identity) to $(NuGetSource) ..." />
+    <Exec Command="dotnet nuget push &quot;%(_NuGetPackageToPush.Identity)&quot; --api-key &quot;$(NuGetApiKey)&quot; --source &quot;$(NuGetSource)&quot; --skip-duplicate" />
+  </Target>
 
 </Project>

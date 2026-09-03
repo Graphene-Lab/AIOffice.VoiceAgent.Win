@@ -17,3 +17,8 @@ kokoro.onnx
 # NuGet
 *.nupkg
 *.snupkg
+
+# Local release staging (same layout as .github/workflows/release-win.yml)
+voiceagent-out/
+stage/
+AIOffice.VoiceAgent.Win-*.zip
