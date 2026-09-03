@@ -21,7 +21,14 @@ jobs:
   publish:
     runs-on: windows-latest
     steps:
+      # Same folder layout as release-win.yml: this repo at ./AIOffice.VoiceAgent.Win and the
+      # sibling at ./AIOffice.VoiceAgent. A root-level checkout would resolve the Win csproj's
+      # relative ProjectReference (..\AIOffice.VoiceAgent) OUTSIDE the workspace and the SDK's
+      # default **/*.cs glob would then compile the sibling sources into the Win project
+      # (missing Whisper types → CS0246). Both subfolders are required for restore/build.
       - uses: actions/checkout@v4
+        with:
+          path: AIOffice.VoiceAgent.Win
       - uses: actions/checkout@v4
         with:
           repository: Graphene-Lab/AIOffice.VoiceAgent
@@ -33,7 +40,7 @@ jobs:
         shell: bash
         run: |
           for i in 1 2 3 4 5 6; do
-            dotnet pack AIOffice.VoiceAgent.Win.csproj -c Release -o ./out -p:SkipNuGetPush=true -p:RestoreForce=true && break
+            dotnet pack AIOffice.VoiceAgent.Win/AIOffice.VoiceAgent.Win.csproj -c Release -o ./out -p:SkipNuGetPush=true -p:RestoreForce=true && break
             echo "retry $i (waiting for dependency packages on nuget.org)..."
             sleep 60
           done
